@@ -1,0 +1,253 @@
+//@version=5
+// ============================================================================
+// G.O.A.T. INSTITUTIONAL BREAKOUT STRATEGY (Nifty Option Buyers)
+// 5-Minute Execution | IB Breakout + VWAP + CPR + Volume Confirmation
+// ============================================================================
+strategy("G.O.A.T. Institutional Breakout Strategy (Nifty)",
+     overlay              = true,
+     initial_capital      = 100000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     pyramiding           = 0,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true,
+     commission_type      = strategy.commission.cash_per_order,
+     commission_value     = 20,
+     slippage             = 1)
+
+// ============================================================================
+// 1. INPUTS
+// ============================================================================
+grpTime = "Session & Time Filters"
+sessTZ          = input.string("Asia/Kolkata", "Exchange Timezone", group = grpTime)
+ibWindowStr     = input.string("0915-0930", "Initial Balance (IB) Window", group = grpTime)
+signalWindowStr = input.string("0930-1100", "Signal Validity Window", group = grpTime)
+eodHour         = input.int(15, "EOD Square-off Hour (24h)", group = grpTime)
+eodMinute       = input.int(10, "EOD Square-off Minute", group = grpTime)
+
+grpFilter = "Structural Filters"
+maxIBRangePts = input.float(100, "Max IB Range (pts) — 100pt Rule", minval = 1, group = grpFilter)
+minBodyPct    = input.float(60,  "Min Candle Body % — 60% Body Rule", minval = 1, maxval = 100, group = grpFilter)
+volMALen      = input.int(20,   "Volume SMA Length", minval = 1, group = grpFilter)
+maxTradesDay  = input.int(1,    "Max Trades Per Day", minval = 1, group = grpFilter)
+
+grpRisk = "Risk Management"
+maxSLPoints   = input.float(20,  "Max Hard SL (index points)", minval = 1, group = grpRisk)
+beTriggerRR   = input.float(1.0, "Break-even Trigger (R multiple)", minval = 0.1, group = grpRisk)
+tpRR          = input.float(2.0, "Take-Profit Target (R multiple)", minval = 0.1, group = grpRisk)
+maxBarsInTrd  = input.int(9,     "Max Candles In Trade (Time-Decay Exit)", minval = 1, group = grpRisk)
+
+grpQty = "Position Sizing"
+qtyLots = input.int(1, "Quantity (lots/contracts)", minval = 1, group = grpQty)
+
+// ============================================================================
+// 2. TIMEFRAME ENFORCEMENT
+// ============================================================================
+if timeframe.in_seconds() != 300
+    runtime.error("This strategy is designed strictly for the 5-minute timeframe. Please switch chart to 5m.")
+
+// ============================================================================
+// 3. SESSION / DAY TRACKING
+// ============================================================================
+tf = timeframe.period
+
+ibSession     = time(tf, ibWindowStr, sessTZ)
+inIB          = not na(ibSession)
+
+sigSession    = time(tf, signalWindowStr, sessTZ)
+inSignalWindow = not na(sigSession)
+
+newDay = ta.change(time("D", sessTZ))
+
+var float ibHigh     = na
+var float ibLow      = na
+var bool  ibLocked   = false
+var bool  dayInvalid = false
+var int   tradesToday = 0
+
+// Reset all daily trackers on new session
+if newDay
+    ibHigh      := na
+    ibLow       := na
+    ibLocked    := false
+    dayInvalid  := false
+    tradesToday := 0
+
+// Build Initial Balance High/Low during 09:15–09:30
+if inIB
+    ibHigh := na(ibHigh) ? high : math.max(ibHigh, high)
+    ibLow  := na(ibLow)  ? low  : math.min(ibLow, low)
+
+// Lock IB range the instant the IB window ends -> apply the 100-point rule
+ibEndTrigger = inIB[1] and not inIB
+if ibEndTrigger and not ibLocked
+    ibLocked := true
+    if not na(ibHigh) and not na(ibLow) and (ibHigh - ibLow) > maxIBRangePts
+        dayInvalid := true
+
+// ============================================================================
+// 4. INSTITUTIONAL INDICATORS
+// ============================================================================
+// -- Indicator 1: VWAP (native, resets each session automatically) --
+vwapVal = ta.vwap(hlc3)
+
+// -- Indicator 2: Daily CPR from previous day's HLC --
+[prevH, prevL, prevC] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)
+cprPivot = (prevH + prevL + prevC) / 3
+cprBC    = (prevH + prevL) / 2
+cprTC    = (cprPivot - cprBC) + cprPivot
+cprTop    = math.max(cprTC, cprBC)
+cprBottom = math.min(cprTC, cprBC)
+
+// -- Indicator 3: Volume SMA / Spike Confirmation --
+volSMA   = ta.sma(volume, volMALen)
+volSpike = volume > volSMA
+
+// ============================================================================
+// 5. CANDLE QUALITY FILTER — 60% BODY RULE
+// ============================================================================
+candleRange = high - low
+bodySize    = math.abs(close - open)
+bodyRuleOK  = candleRange > 0 and (bodySize / candleRange) * 100 >= minBodyPct
+
+// ============================================================================
+// 6. SIGNAL LOGIC
+// ============================================================================
+canTrade = inSignalWindow and ibLocked and not dayInvalid and tradesToday < maxTradesDay and strategy.position_size == 0
+
+longCond = canTrade and not na(ibHigh) and close > ibHigh and close > vwapVal and close > cprTop and bodyRuleOK and volSpike
+shortCond = canTrade and not na(ibLow) and close < ibLow and close < vwapVal and close < cprBottom and bodyRuleOK and volSpike
+
+// ============================================================================
+// 7. TRADE STATE VARIABLES
+// ============================================================================
+var float sigLow      = na   // breakout candle low (for long SL basis)
+var float sigHigh      = na   // breakout candle high (for short SL basis)
+var float sigVwap      = na   // vwap value captured at signal time
+
+var float entryPrice   = na
+var float initialSL    = na
+var float tpPrice      = na
+var float riskPts      = na
+var int   barsInTrade  = 0
+var bool  inLongTrade  = false
+var bool  inShortTrade = false
+var bool  beMoved      = false
+
+// ============================================================================
+// 8. ENTRY EXECUTION
+// ============================================================================
+if longCond
+    sigLow      := low
+    sigVwap     := vwapVal
+    tradesToday := tradesToday + 1
+    strategy.entry("Long/Call", strategy.long, qty = qtyLots)
+    label.new(bar_index, high, "🔥 G.O.A.T CALL ENTRY",
+         style = label.style_label_down, color = color.new(color.lime, 0),
+         textcolor = color.black, size = size.normal)
+
+if shortCond
+    sigHigh     := high
+    sigVwap     := vwapVal
+    tradesToday := tradesToday + 1
+    strategy.entry("Short/Put", strategy.short, qty = qtyLots)
+    label.new(bar_index, low, "🔥 G.O.A.T PUT ENTRY",
+         style = label.style_label_up, color = color.new(color.red, 0),
+         textcolor = color.white, size = size.normal)
+
+// ============================================================================
+// 9. TRADE INITIALIZATION (fires exactly one bar after entry fills)
+// ============================================================================
+justEnteredLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+justEnteredShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if justEnteredLong
+    entryPrice := strategy.position_avg_price
+    slBasis    = math.max(sigVwap, sigLow)          // tighter/closer of VWAP or candle low
+    rawRisk    = entryPrice - slBasis
+    riskPts    := (rawRisk > maxSLPoints or rawRisk <= 0) ? maxSLPoints : rawRisk   // hard cap @ 20 pts
+    initialSL  := entryPrice - riskPts
+    tpPrice    := entryPrice + riskPts * tpRR
+    barsInTrade := 0
+    inLongTrade := true
+    inShortTrade := false
+    beMoved := false
+
+if justEnteredShort
+    entryPrice := strategy.position_avg_price
+    slBasis    = math.min(sigVwap, sigHigh)         // tighter/closer of VWAP or candle high
+    rawRisk    = slBasis - entryPrice
+    riskPts    := (rawRisk > maxSLPoints or rawRisk <= 0) ? maxSLPoints : rawRisk   // hard cap @ 20 pts
+    initialSL  := entryPrice + riskPts
+    tpPrice    := entryPrice - riskPts * tpRR
+    barsInTrade := 0
+    inShortTrade := true
+    inLongTrade := false
+    beMoved := false
+
+// ============================================================================
+// 10. TRADE MANAGEMENT — BREAK-EVEN / TIME DECAY / EOD
+// ============================================================================
+if strategy.position_size != 0
+    barsInTrade := barsInTrade + 1
+
+// Break-even trigger: lock out risk once 1:1 (or configured R) is reached
+if inLongTrade and not beMoved and (high - entryPrice) >= riskPts * beTriggerRR
+    initialSL := math.max(initialSL, entryPrice)
+    beMoved := true
+
+if inShortTrade and not beMoved and (entryPrice - low) >= riskPts * beTriggerRR
+    initialSL := math.min(initialSL, entryPrice)
+    beMoved := true
+
+// Time-decay square-off (theta protection): force exit after N candles if still open
+timeDecayExit = barsInTrade >= maxBarsInTrd and strategy.position_size != 0
+
+// End-of-day square-off at configured IST time
+eodTrigger = hour(time, sessTZ) == eodHour and minute(time, sessTZ) >= eodMinute and strategy.position_size != 0
+
+if timeDecayExit
+    strategy.close_all(comment = "Time-Decay Exit")
+
+if eodTrigger
+    strategy.close_all(comment = "EOD Square-off")
+
+// Apply protective stop / target every bar while in a trade
+if inLongTrade and not na(initialSL) and not na(tpPrice)
+    strategy.exit("Long Exit", from_entry = "Long/Call", stop = initialSL, limit = tpPrice)
+
+if inShortTrade and not na(initialSL) and not na(tpPrice)
+    strategy.exit("Short Exit", from_entry = "Short/Put", stop = initialSL, limit = tpPrice)
+
+// Reset state once flat again (covers SL/TP hit, time-decay exit, or EOD exit)
+justExited = strategy.position_size == 0 and strategy.position_size[1] != 0
+if justExited
+    inLongTrade  := false
+    inShortTrade := false
+    barsInTrade  := 0
+    beMoved      := false
+
+// ============================================================================
+// 11. PLOTTING
+// ============================================================================
+plot(ibLocked and not dayInvalid ? ibHigh : na, title = "IB High", color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 2)
+plot(ibLocked and not dayInvalid ? ibLow  : na, title = "IB Low",  color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 2)
+
+plot(vwapVal, title = "VWAP", color = color.new(color.blue, 0), linewidth = 2)
+
+plot(cprTop,    title = "CPR Top",    color = color.new(color.purple, 0))
+plot(cprBottom, title = "CPR Bottom", color = color.new(color.purple, 0))
+plot(cprPivot,  title = "CPR Pivot",  color = color.new(color.gray, 40))
+
+// Volume overlay + SMA (right-click -> "Move to new pane" for a clean layout)
+plot(volume, title = "Volume", style = plot.style_columns,
+     color = volume > volSMA ? color.new(color.teal, 40) : color.new(color.gray, 70))
+plot(volSMA, title = "Volume SMA (20)", color = color.new(color.orange, 0))
+
+bgcolor(dayInvalid ? color.new(color.red, 90) : na, title = "Invalid Day (IB Range > Max)")
+
+// ============================================================================
+// 12. ALERTS
+// ============================================================================
+alertcondition(longCond,  title = "GOAT CALL Signal", message = "G.O.A.T CALL (CE) breakout signal fired")
+alertcondition(shortCond, title = "GOAT PUT Signal",  message = "G.O.A.T PUT (PE) breakout signal fired")
